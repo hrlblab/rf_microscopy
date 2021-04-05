@@ -235,9 +235,33 @@ def conv2(x, y, mode='same'):
 
 
 if __name__ == "__main__":
+    # n = 4096
+    # r = 256
+    # w = 20
+    # offset = 256
+    # dispRange: List[Union[int, float]] = []
+    # for i in range(-600, 601):
+    #     dispRange.append(i + math.floor(n / 2) + 1)
+    # v = []
+    # for i in range(0, n):
+    #     v.append(i - math.floor(n / 2))
+    # annulus = createAnnulus(v, r, w)
+    #
+    # step 1: specify the initial v position
+    # initial_v = []
+    # for i in range(0, n):
+    #     initial_v.append(-v[i])
+    # selected_columns = []
+    # for i in range(0, n):
+    #     if offset * 0.99 / 1.35 + w / 2 > initial_v[i] > offset * 0.99 / 1.35 - w / 2:
+    #         selected_columns.append(1)
+    #     else:
+    #         selected_columns.append(0)
+
     n = 4096
     r = 256
-    w = 5
+    w = 10
+    pos = 30
     offset = 256
     dispRange: List[Union[int, float]] = []
     for i in range(-600, 601):
@@ -246,13 +270,19 @@ if __name__ == "__main__":
     for i in range(0, n):
         v.append(i - math.floor(n / 2))
     annulus = createAnnulus(v, r, w)
-    abs_v = np.absolute(v)
+
+    # step 2: start to move apart in two directions
+    initial_v = []
+    for i in range(0, n):
+        initial_v.append(-v[i])
     selected_columns = []
     for i in range(0, n):
-        if (offset + w / 2 > abs_v[i] > offset - w / 2) or (w / 2 > v[i] > -w / 2):
+        if (offset * 0.99 / 1.35 + pos + w / 2 > initial_v[i] > offset * 0.99 / 1.35 + pos - w / 2) or \
+                (offset * 0.99 / 1.35 - pos + w / 2 > initial_v[i] > offset * 0.99 / 1.35 - pos - w / 2):
             selected_columns.append(1)
         else:
             selected_columns.append(0)
+
     latticeFourierMask = annulus
     for c in range(0, n):
         if not selected_columns[c]:
@@ -273,11 +303,6 @@ if __name__ == "__main__":
 
     period = n / offset
     if period == round(period):
-        # latticeDithered = np.zeros((4096, 4096))
-        # for s in range(math.floor(-period / 2), math.floor(period / 2) - 1):
-        #     max = np.roll(lattice, s, axis=1)
-        #     latticeDithered = np.add(latticeDithered, max)
-        # latticeDithered = latticeDithered / period
         latticeDithered = conv2(lattice, np.ones((1, int(period))) / period, 'same')
     else:
         for x in lattice_hat:
@@ -292,8 +317,8 @@ if __name__ == "__main__":
     plt.gca().get_autoscale_on()
 
     ax1 = plt.subplot(231)
-    ax1.set_xlim([1600, 2500])
-    ax1.set_ylim([1600, 2500])
+    ax1.set_xlim([1500, 2500])
+    ax1.set_ylim([1500, 2500])
     aa = abs(latticeFourierMask)
     aa[aa > 1e-6] = 1e-6
     ax1.imshow(latticeFourierMask, cmap='hot')
