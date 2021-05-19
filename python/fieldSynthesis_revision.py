@@ -207,32 +207,108 @@ def demoFieldSynthesis():
     plt.pause(0.001)
 
 
-def shiftMatrixByK(mat, k):
-    N = 4095
-    matrix = [[]]
-    j = 0
-    if k < 0:
-        k = -k
-    else:
-        k = N - k
-    while j < N:
-        # Print elements from
-        # index k
-        for i in range(k, N):
-            matrix[j].append(mat[j][i])
-
-        # Print elements before
-        # index k
-        for i in range(0, k):
-            matrix[j].append(mat[j][i])
-
-        j = j + 1
-    return matrix
-
-
 def conv2(x, y, mode='same'):
     return np.rot90(convolve2d(np.rot90(x, 2), np.rot90(y, 2), mode=mode), 2)
 
+
+def osWidth_gui(prof):
+    # df = pd.DataFrame(prof)
+
+    # gives no. of rows along x-axis
+    prof = prof.reshape((len(prof), 1))
+
+    e = np.exp(1)
+
+    # sum over rows for each of the column
+    prof2 = np.cumsum(prof, axis=0)
+    # np.amax(prof) = Maximum of the flattened array
+    prof2_n = prof2 / np.amax(prof2)
+
+    # Find the indices of the maximum values along each column
+    p_maxint = np.argmax(prof, axis=0)
+
+    #FIXME should be 4096
+    num_par_y_array_size = 4096
+    ny = num_par_y_array_size
+
+    totalarea = prof.sum(axis=0)
+    guessthickness_pxl = 3
+    thickness63percent = 0
+
+    while thickness63percent == 0:
+        guessthickness_pxl = guessthickness_pxl + 1
+        if guessthickness_pxl == ny:
+            thickness63percent = float('nan')
+        # csum_norm is a 1xguessthickness_pxl array with all zeros
+        # csum_norm = np.zeros(1, guessthickness_pxl)
+        csum_norm = np.zeros((1, ny))
+        guessstartpoint = max(p_maxint - guessthickness_pxl + 1, 1)
+        guessendpoint = min(p_maxint + guessthickness_pxl - 1, ny) - guessthickness_pxl
+
+        for ii in range(guessstartpoint[0], guessendpoint[0]+1):
+            prof_partial = np.array(prof)
+            indices = list(range(ii, ii + guessthickness_pxl + 1))
+            prof_partial_sum = prof_partial[indices].sum()
+            csum_norm[0, ii] = prof_partial_sum / totalarea
+            if not thickness63percent and csum_norm[0, ii] >= (1 - 1 / e):
+                thickness63percent = guessthickness_pxl
+
+    return thickness63percent * 1
+
+def osWidth_gui_2(prof):
+    # df = pd.DataFrame(prof)
+
+    e = np.exp(1)
+
+    # sum over rows for each of the column
+    prof_row = np.sum(prof, axis=1)
+
+    num_par_y_array_size = 4096
+    ny = num_par_y_array_size
+
+    totalarea = prof_row.sum(axis=0)
+    guessthickness_pxl = 0
+    thickness63percent = 0
+
+    while thickness63percent == 0:
+        # csum_norm is a 1xguessthickness_pxl array with all zeros
+        # csum_norm = np.zeros(1, guessthickness_pxl)
+        csum_norm = np.zeros((1, ny))
+
+        for ii in range(1, 2048):
+            guessthickness_pxl = guessthickness_pxl + 2
+            prof_partial = np.array(prof_row)
+            indices = list(range(2048 - ii, 2048 + ii + 1))
+            prof_partial_sum = prof_partial[indices].sum()
+            csum_norm[0, ii] = prof_partial_sum / totalarea
+            if not thickness63percent and csum_norm[0, ii] >= (1 - 1 / e):
+                thickness63percent = guessthickness_pxl
+
+    return thickness63percent
+
+def analysisbeam_gui(PSFSumY):
+    # FIXME should be 2048
+    cy = 2048
+    centerline = PSFSumY[cy-1]
+    num_par_dx = 1
+    pMaxPos = pWidth_gui(centerline, num_par_dx)
+
+    prof_peak = PSFSumY[:][pMaxPos-1]
+    os_peak_e = osWidth_gui_2(prof_peak)
+
+    return os_peak_e
+
+def pWidth_gui(prof, dy):
+    df = pd.DataFrame(prof)
+
+    # gives no. of rows along x-axis
+    if len(df) == 1:
+        prof = np.transpose(prof)
+
+    # Find the indices of the maximum values along each column
+    pMaxPos = np.argmax(prof, axis=0)
+
+    return pMaxPos
 
 if __name__ == "__main__":
     # n = 4096
@@ -261,7 +337,7 @@ if __name__ == "__main__":
     n = 4096
     r = 256
     w = 10
-    pos = 30
+    pos = 60
     offset = 256
     dispRange: List[Union[int, float]] = []
     for i in range(-600, 601):
@@ -311,7 +387,20 @@ if __name__ == "__main__":
         latticeDithered = ft.fftshift(ft.ifft2(ft.ifftshift(latticeDithered)))
 
     latticeDithered_hat = ft.fftshift(ft.fft2(ft.ifftshift(latticeDithered)))
+    width = osWidth_gui_2(latticeDithered)
+    print(width)
 
+    # # Gaussian Beam Test
+    # x = np.arange(-3.1, 3.2, 0.1)
+    # # Mean = 0, SD = 1.
+    # mean = 0
+    # std = 1
+    # variance = np.square(std)
+    # prof_peak = np.exp(-np.square(x - mean) / 2 * variance) / (np.sqrt(2 * np.pi * variance))
+    # plt.plot(x, prof_peak)
+    # w = osWidth_gui(prof_peak)
+
+    # Draw the light sheet
     fig = plt.figure()
     plt.figure(figsize=(16, 9))
     plt.gca().get_autoscale_on()
