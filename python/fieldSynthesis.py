@@ -233,6 +233,73 @@ def shiftMatrixByK(mat, k):
 def conv2(x, y, mode='same'):
     return np.rot90(convolve2d(np.rot90(x, 2), np.rot90(y, 2), mode=mode), 2)
 
+def createAnnulus(n=256, r=32, w=4):
+    """
+    createAnnulus - create a ring-like structure
+    INPUT
+    n - size of square array or vector
+    r - radius of the ring
+    w - width of the ring
+    OUTPUT
+    an array n x n
+    """
+    if np.isscalar(n):
+        v = np.arange(n)
+        v = v - np.floor(n / 2)
+    else:
+        v = n
+
+    y, x = np.meshgrid(v, v)
+    q = np.hypot(x, y)
+    annulus = abs(q - r) < w
+
+    return annulus
+
+
+def compute_kspace(width):
+    n = 4096
+    r = 256
+
+    dispRange: List[Union[int, float]] = []
+    for i in range(-600, 601):
+        dispRange.append(i + math.floor(n / 2) + 1)
+    v = []
+    for i in range(0, n):
+        v.append(i - math.floor(n / 2))
+    kspace = createAnnulus(v, r, width)
+
+    return kspace
+
+
+def compute_mask(w, pos):
+    offset = 256
+    n = 4096
+    v = []
+    for i in range(0, n):
+        v.append(i - math.floor(n / 2))
+    initial_v = []
+    for i in range(0, n):
+        initial_v.append(-v[i])
+    mask = []
+    for i in range(0, n):
+        if (offset * 0.99 / 1.35 + pos + w / 2 > initial_v[i] > offset * 0.99 / 1.35 + pos - w / 2) or \
+                (offset * 0.99 / 1.35 - pos + w / 2 > initial_v[i] > offset * 0.99 / 1.35 - pos - w / 2):
+            mask.append(1)
+        else:
+            mask.append(0)
+    return mask
+
+
+def compute_masked_kspace(kspace, mask):
+    n = 4096
+    masked_kspace = kspace
+
+    for c in range(0, n):
+        if not mask[c]:
+            masked_kspace[:, c] = False
+    masked_kspace = masked_kspace.astype(float)
+    return masked_kspace
+
 
 if __name__ == "__main__":
     n = 4096

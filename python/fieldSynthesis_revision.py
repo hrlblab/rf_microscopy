@@ -13,6 +13,7 @@ from torch.nn import functional as F
 from torch_metrics import compute_ssim, compute_psnr
 from utils import (add_mask_params, save_json, build_optim, count_parameters,
                                count_trainable_parameters, count_untrainable_parameters, str2bool, str2none)
+from policy_model_def import build_policy_model
 from data_loading import create_data_loader
 import copy
 import random
@@ -29,6 +30,7 @@ from string import ascii_uppercase
 import torch
 import numpy as np
 from tensorboardX import SummaryWriter
+import tensorflow as tf
 
 
 def compute_backprop_trajectory(args, kspace, masked_kspace, mask, unnorm_gt, recons, gt_mean, gt_std,
@@ -522,138 +524,6 @@ def load_recon_model(width, position):
     return recon
 
 
-class ConvBlock(nn.Module):
-    """
-    A Convolutional Block that consists of two convolution layers each followed by
-    instance normalization, relu activation and dropout.
-    """
-
-    def __init__(self, in_chans, out_chans, drop_prob=0.0, pool_size=2):
-        """
-        Args:
-            in_chans (int): Number of channels in the input.
-            out_chans (int): Number of channels in the output.
-            drop_prob (float): Dropout probability.
-        """
-        super().__init__()
-
-        self.in_chans = in_chans
-        self.out_chans = out_chans
-        self.drop_prob = drop_prob
-        self.pool_size = pool_size
-
-        layers = [nn.Conv2d(in_chans, out_chans, kernel_size=3, padding=1),
-                  nn.InstanceNorm2d(out_chans),  # Does not use batch statistics: unaffected by model.eval()
-                  nn.ReLU(),
-                  nn.Dropout2d(drop_prob)]
-
-        if pool_size > 1:
-            layers.append(nn.MaxPool2d(pool_size))
-
-        self.layers = nn.Sequential(*layers)
-
-    def forward(self, input):
-        """
-        Args:
-            input (torch.Tensor): Input tensor of shape [batch_size, self.in_chans, height, width]
-
-        Returns:
-            (torch.Tensor): Output tensor of shape [batch_size, self.out_chans, height, width]
-        """
-        return self.layers(input)
-
-    def __repr__(self):
-        return f'ConvBlock(in_chans={self.in_chans}, out_chans={self.out_chans}, ' \
-               f'drop_prob={self.drop_prob}, max_pool_size={self.pool_size})'
-
-
-class PolicyModel(nn.Module):
-    def __init__(self, resolution, in_chans, chans, num_pool_layers, drop_prob, fc_size):
-        """
-        Args:
-            in_chans (int): Number of channels in the input to the U-Net model.
-            resolution (int): Number of neurons in the output FC layer (equal to image number of rows in kspace).
-            chans (int): Number of output channels of the first convolution layer.
-            num_pool_layers (int): Number of down-sampling layers.
-            drop_prob (float): Dropout probability.
-        """
-        super().__init__()
-        self.resolution = resolution
-        self.in_chans = in_chans
-        self.chans = chans
-        self.num_pool_layers = num_pool_layers
-        self.drop_prob = drop_prob
-        self.fc_size = fc_size
-
-        # Size of image encoding after flattening of convolutional output
-        # There are 1 + num_pool_layers blocks
-        # The first block increases channels from in_chans to chans, without any pooling
-        # Every block except the first 2x2 max pools, reducing output by a factor 4
-        # Every block except the first doubles channels, increasing output by a factor 2
-        self.pool_size = 2
-        self.flattened_size = resolution ** 2 * chans
-
-        # Initial from in_chans to chans
-        self.channel_layer = ConvBlock(in_chans, chans, drop_prob, pool_size=1)
-        # Downsampling convolution
-        # These are num_pool_layers layers where each layers 2x2 max pools, and doubles the number of channels
-        self.down_sample_layers = nn.ModuleList([])
-        ch = chans
-        for _ in range(num_pool_layers):
-            self.down_sample_layers += [ConvBlock(ch, ch * 2, drop_prob, pool_size=self.pool_size)]
-            # Keep track of number of output neurons
-            self.flattened_size = self.flattened_size * 2 // self.pool_size ** 2
-            ch *= 2
-
-        self.fc_out = nn.Sequential(
-            nn.Linear(in_features=self.flattened_size, out_features=self.fc_size),
-            nn.LeakyReLU(),
-            nn.Linear(in_features=self.fc_size, out_features=self.fc_size),
-            nn.LeakyReLU(),
-            nn.Linear(in_features=self.fc_size, out_features=resolution)
-        )
-
-    def forward(self, image):
-        """
-        Args:
-            image (torch.Tensor): Input tensor of shape [batch_size, self.in_chans, height, width]
-            mask (torch.Tensor): Input tensor of shape [resolution], containing 0s and 1s
-
-        Returns:
-            (torch.Tensor): Output tensor of shape [batch_size, self.out_chans, height, width]
-        """
-
-        # Image embedding
-        # Initial block
-        image_emb = self.channel_layer(image)
-        # Apply down-sampling layers
-        for layer in self.down_sample_layers:
-            image_emb = layer(image_emb)
-        image_emb = self.fc_out(image_emb.flatten(start_dim=1))  # flatten all but batch dimension
-        assert len(image_emb.shape) == 2
-        return image_emb
-
-
-def build_policy_model(args):
-    """
-    Args:
-        in_chans (int): Number of channels in the input to the U-Net model.
-        resolution (int): Number of neurons in the output FC layer (equal to image number of rows in kspace).
-        chans (int): Number of output channels of the first convolution layer.
-        num_pool_layers (int): Number of down-sampling layers.
-        drop_prob (float): Dropout probability.
-    """
-    model = PolicyModel(
-        resolution=args.resolution,
-        in_chans=1,
-        chans=args.num_chans,
-        num_pool_layers=args.num_layers,
-        drop_prob=args.drop_prob,
-        fc_size=args.fc_size,
-    ).to(args.device)
-    return model
-
-
 def load_policy_model(checkpoint_file, optim=False):
     checkpoint = torch.load(checkpoint_file)
     args = checkpoint['args']
@@ -680,6 +550,8 @@ def load_policy_model(checkpoint_file, optim=False):
     return model, args
 
 
+# 当前width 49
+# 给一个probs -> 50 -> 从-25到25
 def get_policy_probs(model, recons, mask):
     channel_size = mask.shape[1]
     res = mask.size(-2)
@@ -702,7 +574,8 @@ def get_policy_probs(model, recons, mask):
 def create_arg_parser():
     parser = argparse.ArgumentParser()
 
-    parser.add_argument('--resolution', default=128, type=int, help='Resolution of images')
+    parser.add_argument('--resolution', default=4096, type=int, help='Resolution of images')
+    parser.add_argument('--filters', type=int, default=5, help='Number of convolution kernels。')
     parser.add_argument('--dataset', default='knee', help='Dataset type to use.')
     parser.add_argument('--data_path', type=pathlib.Path, required=True,
                         help="Path to the dataset. Make sure to set this consistently with the 'dataset' "
@@ -712,10 +585,6 @@ def create_arg_parser():
     parser.add_argument('--acquisition', type=str2none, default=None,
                         help='Use only volumes acquired using the provided acquisition method. Options are: '
                              'CORPD_FBK, CORPDFS_FBK (fat-suppressed), and not provided (both used).')
-    parser.add_argument('--recon_model_checkpoint', type=pathlib.Path, required=True,
-                        help='Path to a pretrained reconstruction model.')
-    parser.add_argument('--num_trajectories', type=int, default=8, help='Number of actions to sample every acquisition '
-                                                                        'step during training.')
     parser.add_argument('--report_interval', type=int, default=1000, help='Period of loss reporting')
     parser.add_argument('--num_workers', type=int, default=4, help='Number of workers to use for data loading')
     parser.add_argument('--device', type=str, default='cuda',
@@ -800,88 +669,6 @@ def create_arg_parser():
     return parser
 
 
-def build_reconstruction_model(args):
-    kengal_model = UnetModel(
-        in_chans=1,
-        out_chans=1,
-        chans=args.num_chans,
-        num_pool_layers=args.num_pools,
-        drop_prob=args.drop_prob
-    ).to(args.device)
-    return kengal_model
-
-
-class UnetModel(nn.Module):
-    """
-    PyTorch implementation of a U-Net model.
-
-    This is based on:
-        Olaf Ronneberger, Philipp Fischer, and Thomas Brox. U-net: Convolutional networks
-        for biomedical image segmentation. In International Conference on Medical image
-        computing and computer-assisted intervention, pages 234–241. Springer, 2015.
-    """
-
-    def __init__(self, in_chans, out_chans, chans, num_pool_layers, drop_prob):
-        """
-        Args:
-            in_chans (int): Number of channels in the input to the U-Net model.
-            out_chans (int): Number of channels in the output to the U-Net model.
-            chans (int): Number of output channels of the first convolution layer.
-            num_pool_layers (int): Number of down-sampling and up-sampling layers.
-            drop_prob (float): Dropout probability.
-        """
-        super().__init__()
-
-        self.in_chans = in_chans
-        self.out_chans = out_chans
-        self.chans = chans
-        self.num_pool_layers = num_pool_layers
-        self.drop_prob = drop_prob
-
-        self.down_sample_layers = nn.ModuleList([ConvBlock(in_chans, chans, drop_prob)])
-        ch = chans
-        for _ in range(num_pool_layers - 1):
-            self.down_sample_layers += [ConvBlock(ch, ch * 2, drop_prob)]
-            ch *= 2
-        self.conv = ConvBlock(ch, ch, drop_prob)
-
-        self.up_sample_layers = nn.ModuleList()
-        for _ in range(num_pool_layers - 1):
-            self.up_sample_layers += [ConvBlock(ch * 2, ch // 2, drop_prob)]
-            ch //= 2
-        self.up_sample_layers += [ConvBlock(ch * 2, ch, drop_prob)]
-        self.conv2 = nn.Sequential(
-            nn.Conv2d(ch, ch // 2, kernel_size=1),
-            nn.Conv2d(ch // 2, out_chans, kernel_size=1),
-            nn.Conv2d(out_chans, out_chans, kernel_size=1),
-        )
-
-    def forward(self, input):
-        """
-        Args:
-            input (torch.Tensor): Input tensor of shape [batch_size, self.in_chans, height, width]
-
-        Returns:
-            (torch.Tensor): Output tensor of shape [batch_size, self.out_chans, height, width]
-        """
-        stack = []
-        output = input
-        # Apply down-sampling layers
-        for layer in self.down_sample_layers:
-            output = layer(output)
-            stack.append(output)
-            output = F.max_pool2d(output, kernel_size=2)
-
-        output = self.conv(output)
-
-        # Apply up-sampling layers
-        for layer in self.up_sample_layers:
-            output = F.interpolate(output, scale_factor=2, mode='bilinear', align_corners=False)
-            output = torch.cat([output, stack.pop()], dim=1)
-            output = layer(output)
-        return self.conv2(output)
-
-
 def create_data_range_dict(args, loader):
     # Locate ground truths of a volume
     gt_vol_dict = {}
@@ -940,9 +727,9 @@ def train_and_eval(args, recon_args, recon_model):
         # Improvement model to train
         model = build_policy_model(args)
         # Add mask parameters for training
-        args = add_mask_params(args)
-        if args.data_parallel:
-            model = torch.nn.DataParallel(model)
+        # args = add_mask_params(args)
+        # if args.data_parallel:
+        #     model = torch.nn.DataParallel(model)
         optimiser = build_optim(args, model.parameters())
         start_epoch = 0
         # Create directory to store results in
@@ -954,8 +741,8 @@ def train_and_eval(args, recon_args, recon_model):
         savestr = '{}_res{}_al{}_accel{}_k{}_{}'.format(args.dataset, args.resolution, args.acquisition_steps,
                                                            args.accelerations, args.num_trajectories,
                                                            ''.join(choice(ascii_uppercase) for _ in range(5)))
-        args.run_dir = args.exp_dir / savestr
-        args.run_dir.mkdir(parents=True, exist_ok=False)
+        # # args.run_dir = args.exp_dir / savestr
+        # args.run_dir.mkdir(parents=True, exist_ok=False)
 
     args.resumed = resumed
 
@@ -1009,7 +796,7 @@ def train_and_eval(args, recon_args, recon_model):
         logging.info(
             f'Epoch = [{epoch+1:3d}/{args.num_epochs:3d}] TrainLoss = {train_loss:.3g} TrainTime = {train_time:.2f}s '
         )
-
+        # 改loss -> width
         if args.do_train_ssim:
             do_and_log_evaluation(args, epoch, recon_model, model, train_loader, writer, 'Train', train_data_range_dict)
         do_and_log_evaluation(args, epoch, recon_model, model, dev_loader, writer, 'Val', dev_data_range_dict)
@@ -1056,8 +843,21 @@ def do_and_log_evaluation(args, epoch, recon_model, model, loader, writer, parti
     logging.info(f'{partition}ScoreTime = {score_time:.2f}s')
 
 
-def compute_next_step_reconstruction(recon_model, kspace, masked_kspace, mask, next_rows):
-    return mask, masked_kspace, recon
+class PolicyNet(nn.Module):
+    def __init__(self, inplanes, outplanes):
+        super(PolicyNet, self).__init__()
+        self.outplanes = outplanes
+        self.conv = nn.Conv2d(inplanes, 1, kernel_size=1)
+        self.bn = nn.BatchNorm2d(1)
+        self.logsoftmax = nn.LogSoftmax(dim=1)
+        self.fc = nn.Linear(outplanes - 1, outplanes)
+
+    def forward(self, x):
+        x = F.relu(self.bn(self.conv(x)))
+        x = x.view(-1, self.outplanes - 1)
+        x = self.fc(x)
+        probas = self.logsoftmax(x).exp()
+        return probas
 
 
 def evaluate(args, epoch, recon_model, model, loader, writer, partition, data_range_dict):
@@ -1075,7 +875,6 @@ def evaluate(args, epoch, recon_model, model, loader, writer, partition, data_ra
     :return: (dict: average SSIMS per time step, dict: average PSNR per time step, float: evaluation duration)
     """
     model.eval()
-    ssims, psnrs = 0, 0
     tbs = 0  # data set size counter
     start = time.perf_counter()
     with torch.no_grad():
@@ -1096,6 +895,7 @@ def evaluate(args, epoch, recon_model, model, loader, writer, partition, data_ra
 
             # Base reconstruction model forward pass
             recons = recon_model(zf)
+            # 改ssim -> compute_score
             unnorm_recons = recons[:, :, :, :] * gt_std + gt_mean
             init_ssim_val = compute_ssim(unnorm_recons, unnorm_gt, size_average=False,
                                          data_range=data_range).mean(dim=(-1, -2)).sum()
@@ -1117,21 +917,8 @@ def evaluate(args, epoch, recon_model, model, loader, writer, partition, data_ra
                 mask, masked_kspace, zf, recons = compute_next_step_reconstruction(recon_model, kspace,
                                                                                    masked_kspace, mask, actions)
 
-                ssim_scores, psnr_scores = compute_scores(args, recons, gt_mean, gt_std, unnorm_gt, data_range,
-                                                          comp_psnr=True)
-                assert len(ssim_scores.shape) == 2
-                ssim_scores = ssim_scores.mean(-1).sum()
-                psnr_scores = psnr_scores.mean(-1).sum()
-                # eventually shape = al_steps
-                batch_ssims.append(ssim_scores.item())
-                batch_psnrs.append(psnr_scores.item())
+                score = compute_scores(width, position)
 
-            # shape of al_steps
-            ssims += np.array(batch_ssims)
-            psnrs += np.array(batch_psnrs)
-
-    ssims /= tbs
-    psnrs /= tbs
 
     # Logging
     if partition in ['Val', 'Train']:
@@ -1155,7 +942,7 @@ def evaluate(args, epoch, recon_model, model, loader, writer, partition, data_ra
     else:
         raise ValueError(f"'partition' should be in ['Train', 'Val', 'Test'], not: {partition}")
 
-    return ssims, psnrs, time.perf_counter() - start
+    return time.perf_counter() - start
 
 
 def main(args):
@@ -1164,7 +951,7 @@ def main(args):
     """
     logging.info(args)
     # Reconstruction model
-    recon_args, recon_model = load_recon_model(args)
+    recon_args, recon_model = load_recon_model(w, pos)
 
     # Policy model to train
     # args.do_train -> default to be true
@@ -1243,6 +1030,16 @@ def wrap_main(args):
 
 
 if __name__ == "__main__":
+
+    w = 10
+    pos = 60
+    kspace = compute_kspace(w)
+    mask = compute_mask(w, pos)
+    masked_kspace = compute_masked_kspace(kspace, mask)
+    recon = load_recon_model(w, pos)
+    score = compute_scores(recon)
+    print(score)
+
     # n = 4096
     # r = 256
     # w = 20data_loading.py
@@ -1383,15 +1180,6 @@ if __name__ == "__main__":
     # plt.pause(0.001)
 
     ##demoFieldSynthesis()
-
-    w = 10
-    pos = 60
-    kspace = compute_kspace(w)
-    mask = compute_mask(w, pos)
-    masked_kspace = compute_masked_kspace(kspace, mask)
-    recon = load_recon_model(w, pos)
-    score = compute_scores(recon)
-    print(score)
 
     # model, = load_policy_model()
     # policy, probs = get_policy_probs(model, recon, mask)
