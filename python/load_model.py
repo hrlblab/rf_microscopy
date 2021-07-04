@@ -78,17 +78,17 @@ def doFieldSynthesisLineScan(F_hat, L_hat):
         fieldSynthesis - Field synthesis construction by doing a line scan in the back focal plane
     '''
     # Do the Field Synthesis method of performing a line scan at the back focal plane
-    fieldSynthesis = np.zeros_like(F_hat)
+    field_synthesis = np.zeros_like(F_hat)
 
-    for a in range(fieldSynthesis.shape[1]):
+    for a in range(field_synthesis.shape[1]):
         # Instaneous scan in frequency space
-        T_hat_a = F_hat * np.roll(L_hat, a - fieldSynthesis.shape[1] // 2, 1)
+        T_hat_a = F_hat * np.roll(L_hat, a - field_synthesis.shape[1] // 2, 1)
         # Instaneous scan in object space
         T_a = ft.fftshift(ft.fft2(ft.ifftshift(T_hat_a)))
         # Incoherent summing of the intensities
-        fieldSynthesis = fieldSynthesis + np.abs(T_a) ** 2
+        field_synthesis = field_synthesis + np.abs(T_a) ** 2
 
-    return fieldSynthesis
+    return field_synthesis
 
 
 def conv2(x, y, mode='same'):
@@ -114,27 +114,27 @@ def osWidth_gui(prof):
     num_par_y_array_size = 4096
     ny = num_par_y_array_size
 
-    totalarea = prof.sum(axis=0)
-    guessthickness_pxl = 3
+    total_area = prof.sum(axis=0)
+    guess_thickness_pxl = 3
     thickness63percent = 0
 
     while thickness63percent == 0:
-        guessthickness_pxl = guessthickness_pxl + 1
-        if guessthickness_pxl == ny:
+        guess_thickness_pxl = guess_thickness_pxl + 1
+        if guess_thickness_pxl == ny:
             thickness63percent = float('nan')
         # csum_norm is a 1xguessthickness_pxl array with all zeros
         # csum_norm = np.zeros(1, guessthickness_pxl)
         csum_norm = np.zeros((1, ny))
-        guessstartpoint = max(p_maxint - guessthickness_pxl + 1, 1)
-        guessendpoint = min(p_maxint + guessthickness_pxl - 1, ny) - guessthickness_pxl
+        guess_start_point = max(p_maxint - guess_thickness_pxl + 1, 1)
+        guess_end_point = min(p_maxint + guess_thickness_pxl - 1, ny) - guess_thickness_pxl
 
-        for ii in range(guessstartpoint[0], guessendpoint[0] + 1):
+        for ii in range(guess_start_point[0], guess_end_point[0] + 1):
             prof_partial = np.array(prof)
-            indices = list(range(ii, ii + guessthickness_pxl + 1))
+            indices = list(range(ii, ii + guess_thickness_pxl + 1))
             prof_partial_sum = prof_partial[indices].sum()
-            csum_norm[0, ii] = prof_partial_sum / totalarea
+            csum_norm[0, ii] = prof_partial_sum / total_area
             if not thickness63percent and csum_norm[0, ii] >= (1 - 1 / e):
-                thickness63percent = guessthickness_pxl
+                thickness63percent = guess_thickness_pxl
 
     return thickness63percent * 1
 
@@ -150,8 +150,8 @@ def osWidth_gui_2(prof):
     num_par_y_array_size = 4096
     ny = num_par_y_array_size
 
-    totalarea = prof_row.sum(axis=0)
-    guessthickness_pxl = 0
+    total_area = prof_row.sum(axis=0)
+    guess_thickness_pxl = 0
     thickness63percent = 0
 
     while thickness63percent == 0:
@@ -160,13 +160,13 @@ def osWidth_gui_2(prof):
         csum_norm = np.zeros((1, ny))
 
         for ii in range(1, 2048):
-            guessthickness_pxl = guessthickness_pxl + 2
+            guess_thickness_pxl = guess_thickness_pxl + 2
             prof_partial = np.array(prof_row)
             indices = list(range(2048 - ii, 2048 + ii + 1))
             prof_partial_sum = prof_partial[indices].sum()
-            csum_norm[0, ii] = prof_partial_sum / totalarea
+            csum_norm[0, ii] = prof_partial_sum / total_area
             if not thickness63percent and csum_norm[0, ii] >= (1 - 1 / e):
-                thickness63percent = guessthickness_pxl
+                thickness63percent = guess_thickness_pxl
 
     return thickness63percent
 
@@ -194,6 +194,7 @@ def pWidth_gui(prof, dy):
     pMaxPos = np.argmax(prof, axis=0)
 
     return pMaxPos
+
 
 def compute_kspace(width):
     n = 4096
@@ -240,12 +241,12 @@ def compute_masked_kspace(kspace, mask):
     return masked_kspace
 
 
-def compute_scores(recon):
+def compute_scores(model):
     # df = pd.DataFrame(prof)
     e = np.exp(1)
 
     # sum over rows for each of the column
-    prof_row = np.sum(recon, axis=1)
+    prof_row = np.sum(model, axis=1)
 
     num_par_y_array_size = 4096
     ny = num_par_y_array_size
@@ -282,8 +283,8 @@ def load_model(width, position):
     mask = compute_mask(width, position)
     masked_kspace = compute_masked_kspace(kspace, mask)
 
-    fieldSynthesisProfile = ft.fftshift(ft.ifft(ft.ifftshift(masked_kspace)))
-    df = pd.DataFrame(fieldSynthesisProfile)
+    field_synthesis_profile = ft.fftshift(ft.ifft(ft.ifftshift(masked_kspace)))
+    df = pd.DataFrame(field_synthesis_profile)
     lattice_efield = ft.fftshift(ft.ifft2(ft.ifftshift(masked_kspace)))
     lattice = abs(lattice_efield) ** 2
     lattice_hat = ft.fftshift(ft.fft2(ft.ifftshift(lattice)))

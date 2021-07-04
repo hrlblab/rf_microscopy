@@ -1,4 +1,3 @@
-from typing import List, Union
 import scipy.fftpack as ft
 import scipy.signal as sig
 from scipy.stats import norm
@@ -10,9 +9,9 @@ from scipy.signal import convolve2d
 import torch
 from torch import nn
 from torch.nn import functional as F
-from torch_metrics import compute_ssim, compute_psnr
 from utils import (add_mask_params, save_json, build_optim, count_parameters,
-                               count_trainable_parameters, count_untrainable_parameters, str2bool, str2none)
+                   count_trainable_parameters, count_untrainable_parameters, str2bool, str2none)
+from load_model import (compute_kspace, compute_mask, compute_masked_kspace, compute_scores, load_model)
 from policy_model_def import build_policy_model
 from data_loading import create_data_loader
 import copy
@@ -36,7 +35,7 @@ import tensorflow as tf
 def compute_backprop_trajectory(args, kspace, masked_kspace, mask, unnorm_gt, recons, gt_mean, gt_std,
                                 data_range, model, recon_model, step, action_list, logprob_list, reward_list):
     # Base score from which to calculate acquisition rewards
-    base_score = compute_scores(recon_model)
+    prev_score = compute_scores(recon_model)
     # Get policy and probabilities.
     policy, probs = get_policy_probs(model, recons, mask)
     # Sample actions from the policy. For greedy (or at step = 0) we sample num_trajectories actions from the
@@ -59,11 +58,10 @@ def compute_backprop_trajectory(args, kspace, masked_kspace, mask, unnorm_gt, re
         actions = actions.squeeze(1)
 
     # Obtain rewards in parallel by taking actions in parallel
-    mask, masked_kspace, recons = compute_next_step_reconstruction(recon_model, kspace,
-                                                                       masked_kspace, mask, actions)
-    ssim_scores = compute_scores(recon_model)
+    mask, masked_kspace, recons = compute_next_step_reconstruction(recon_model, kspace, masked_kspace, mask, actions)
+    new_scores = compute_scores(recon_model)
     # batch x num_trajectories
-    action_rewards = ssim_scores - base_score
+    action_rewards = new_scores - prev_score
     # batch x 1
     avg_reward = torch.mean(action_rewards, dim=-1, keepdim=True)
     # Store for non-greedy model (we need the full return before we can do a backprop step)
@@ -122,6 +120,24 @@ def compute_backprop_trajectory(args, kspace, masked_kspace, mask, unnorm_gt, re
             loss.backward()  # Store gradients
 
     return loss, mask, masked_kspace, recons
+
+
+def compute_next_step_reconstruction(recon_model, kspace, masked_kspace, mask, next_rows):
+
+    mask, masked_kspace = acquire_rows_in_batch_parallel(kspace, masked_kspace, mask, next_rows)
+
+    channel_size = masked_kspace.shape[1]
+    res = masked_kspace.size(-2)
+
+    masked_kspace = masked_kspace.view(mask.size(0) * channel_size, 1, res, res, 2)
+    zf, _, _ = get_new_zf(masked_kspace)
+    recon = recon_model(zf)
+
+    # Reshape back to B X C (=parallel acquisitions) x H x W
+    recon = recon.view(mask.size(0), channel_size, res, res)
+    zf = zf.view(mask.size(0), channel_size, res, res)
+    masked_kspace = masked_kspace.view(mask.size(0), channel_size, res, res, 2)
+    return mask, masked_kspace, zf, recon
 
 
 def train_epoch(args, epoch, recon_model, model, loader, optimiser, writer, data_range_dict):
@@ -207,323 +223,6 @@ def train_epoch(args, epoch, recon_model, model, loader, optimiser, writer, data
     return np.mean(epoch_loss), time.perf_counter() - start_epoch
 
 
-def createAnnulus(n=256, r=32, w=4):
-    ''' createAnnulus - create a ring-like structure
-    INPUT
-    n - size of square array or vector
-    r - radius of the ring
-    w - width of the ring
-    OUTPUT
-    an array n x n
-    '''
-    if np.isscalar(n):
-        v = np.arange(n)
-        v = v - np.floor(n / 2)
-    else:
-        v = n
-
-    y, x = np.meshgrid(v, v)
-    q = np.hypot(x, y)
-    annulus = abs(q - r) < w
-
-    return annulus
-
-
-def doConventionalScan(Fsqmod, Lsqmod):
-    '''Simulate Conventional digital scanning / dithering
-        INPUT
-        F_sqmod - Square modulus of F at the front focal plane
-        L_sqmod - Square modulus of L at the front focal plane
-        OUTPUT
-        scanned - Scanned (dithered) intensity of Fsqmod by Lsqmod
-    '''
-    # Manually scan by shifting Fsqmod and multiplying by Lsqmod
-    scanned = np.zeros(Fsqmod.shape)
-    center = Lsqmod.shape[1] // 2
-
-    for x in range(np.size(Fsqmod, 1)):
-        scanned = scanned + np.roll(Fsqmod, x - center, 1) * Lsqmod[center, x]
-
-    return scanned
-
-
-def doConventionalScanHat(F_hat, L_hat):
-    '''Simulate Conventional digital scanning / dithering from frequency space representations
-       INPUT
-       F_hat - Mask at back focal plane
-       L_hat - Line scan profile in frequency space at the back focal plane
-       OUTPUT
-       scanned - Scanned (dithered) intensity of Fsqmod by Lsqmod at front focal plane
-    '''
-    F_hat = ft.ifftshift(F_hat)
-    F = ft.ifft2(F_hat)
-    F = ft.fftshift(F)
-    # This is the illumination intensity pattern
-    Fsqmod = np.real(F * np.conj(F))
-
-    L_hat = ft.ifftshift(L_hat)
-    L = ft.ifft2(L_hat)
-    L = ft.fftshift(L)
-    Lsqmod = L * np.conj(L)
-
-    scanned = doConventionalScan(Fsqmod, Lsqmod)
-    return scanned
-
-
-def doFieldSynthesisLineScan(F_hat, L_hat):
-    '''Simulate Field Synthesis Method
-        INPUT
-        F_hat - Frequency space representation of illumination pattern, mask at back focal plane
-        L_hat - Line scan profile in frequency space at the back focal plane
-        OUTPUT
-        fieldSynthesis - Field synthesis construction by doing a line scan in the back focal plane
-    '''
-    # Do the Field Synthesis method of performing a line scan at the back focal plane
-    fieldSynthesis = np.zeros_like(F_hat)
-
-    for a in range(fieldSynthesis.shape[1]):
-        # Instaneous scan in frequency space
-        T_hat_a = F_hat * np.roll(L_hat, a - fieldSynthesis.shape[1] // 2, 1)
-        # Instaneous scan in object space
-        T_a = ft.fftshift(ft.fft2(ft.ifftshift(T_hat_a)))
-        # Incoherent summing of the intensities
-        fieldSynthesis = fieldSynthesis + np.abs(T_a) ** 2
-
-    return fieldSynthesis
-
-
-def conv2(x, y, mode='same'):
-    return np.rot90(convolve2d(np.rot90(x, 2), np.rot90(y, 2), mode=mode), 2)
-
-
-def osWidth_gui(prof):
-    # df = pd.DataFrame(prof)
-
-    # gives no. of rows along x-axis
-    prof = prof.reshape((len(prof), 1))
-
-    e = np.exp(1)
-
-    # sum over rows for each of the column
-    prof2 = np.cumsum(prof, axis=0)
-    # np.amax(prof) = Maximum of the flattened array
-    prof2_n = prof2 / np.amax(prof2)
-
-    # Find the indices of the maximum values along each column
-    p_maxint = np.argmax(prof, axis=0)
-
-    num_par_y_array_size = 4096
-    ny = num_par_y_array_size
-
-    totalarea = prof.sum(axis=0)
-    guessthickness_pxl = 3
-    thickness63percent = 0
-
-    while thickness63percent == 0:
-        guessthickness_pxl = guessthickness_pxl + 1
-        if guessthickness_pxl == ny:
-            thickness63percent = float('nan')
-        # csum_norm is a 1xguessthickness_pxl array with all zeros
-        # csum_norm = np.zeros(1, guessthickness_pxl)
-        csum_norm = np.zeros((1, ny))
-        guessstartpoint = max(p_maxint - guessthickness_pxl + 1, 1)
-        guessendpoint = min(p_maxint + guessthickness_pxl - 1, ny) - guessthickness_pxl
-
-        for ii in range(guessstartpoint[0], guessendpoint[0] + 1):
-            prof_partial = np.array(prof)
-            indices = list(range(ii, ii + guessthickness_pxl + 1))
-            prof_partial_sum = prof_partial[indices].sum()
-            csum_norm[0, ii] = prof_partial_sum / totalarea
-            if not thickness63percent and csum_norm[0, ii] >= (1 - 1 / e):
-                thickness63percent = guessthickness_pxl
-
-    return thickness63percent * 1
-
-
-def osWidth_gui_2(prof):
-    # df = pd.DataFrame(prof)
-
-    e = np.exp(1)
-
-    # sum over rows for each of the column
-    prof_row = np.sum(prof, axis=1)
-
-    num_par_y_array_size = 4096
-    ny = num_par_y_array_size
-
-    totalarea = prof_row.sum(axis=0)
-    guessthickness_pxl = 0
-    thickness63percent = 0
-
-    while thickness63percent == 0:
-        # csum_norm is a 1xguessthickness_pxl array with all zeros
-        # csum_norm = np.zeros(1, guessthickness_pxl)
-        csum_norm = np.zeros((1, ny))
-
-        for ii in range(1, 2048):
-            guessthickness_pxl = guessthickness_pxl + 2
-            prof_partial = np.array(prof_row)
-            indices = list(range(2048 - ii, 2048 + ii + 1))
-            prof_partial_sum = prof_partial[indices].sum()
-            csum_norm[0, ii] = prof_partial_sum / totalarea
-            if not thickness63percent and csum_norm[0, ii] >= (1 - 1 / e):
-                thickness63percent = guessthickness_pxl
-
-    return thickness63percent
-
-
-def analysisbeam_gui(PSFSumY):
-    cy = 2048
-    centerline = PSFSumY[cy - 1]
-    num_par_dx = 1
-    pMaxPos = pWidth_gui(centerline, num_par_dx)
-
-    prof_peak = PSFSumY[:][pMaxPos - 1]
-    os_peak_e = osWidth_gui_2(prof_peak)
-
-    return os_peak_e
-
-
-def pWidth_gui(prof, dy):
-    df = pd.DataFrame(prof)
-
-    # gives no. of rows along x-axis
-    if len(df) == 1:
-        prof = np.transpose(prof)
-
-    # Find the indices of the maximum values along each column
-    pMaxPos = np.argmax(prof, axis=0)
-
-    return pMaxPos
-
-
-def createAnnulus(n=256, r=32, w=4):
-    """
-    createAnnulus - create a ring-like structure
-    INPUT
-    n - size of square array or vector
-    r - radius of the ring
-    w - width of the ring
-    OUTPUT
-    an array n x n
-    """
-    if np.isscalar(n):
-        v = np.arange(n)
-        v = v - np.floor(n / 2)
-    else:
-        v = n
-
-    y, x = np.meshgrid(v, v)
-    q = np.hypot(x, y)
-    annulus = abs(q - r) < w
-
-    return annulus
-
-
-def compute_kspace(width):
-    n = 4096
-    r = 256
-
-    dispRange: List[Union[int, float]] = []
-    for i in range(-600, 601):
-        dispRange.append(i + math.floor(n / 2) + 1)
-    v = []
-    for i in range(0, n):
-        v.append(i - math.floor(n / 2))
-    kspace = createAnnulus(v, r, width)
-
-    return kspace
-
-
-def compute_mask(w, pos):
-    offset = 256
-    n = 4096
-    v = []
-    for i in range(0, n):
-        v.append(i - math.floor(n / 2))
-    initial_v = []
-    for i in range(0, n):
-        initial_v.append(-v[i])
-    mask = []
-    for i in range(0, n):
-        if (offset * 0.99 / 1.35 + pos + w / 2 > initial_v[i] > offset * 0.99 / 1.35 + pos - w / 2) or \
-                (offset * 0.99 / 1.35 - pos + w / 2 > initial_v[i] > offset * 0.99 / 1.35 - pos - w / 2):
-            mask.append(1)
-        else:
-            mask.append(0)
-    return mask
-
-
-def compute_masked_kspace(kspace, mask):
-    n = 4096
-    masked_kspace = kspace
-
-    for c in range(0, n):
-        if not mask[c]:
-            masked_kspace[:, c] = False
-    masked_kspace = masked_kspace.astype(float)
-    return masked_kspace
-
-
-def compute_scores(recon):
-    # df = pd.DataFrame(prof)
-    e = np.exp(1)
-
-    # sum over rows for each of the column
-    prof_row = np.sum(recon, axis=1)
-
-    num_par_y_array_size = 4096
-    ny = num_par_y_array_size
-
-    totalarea = prof_row.sum(axis=0)
-    guessthickness_pxl = 0
-    thickness63percent = 0
-
-    while thickness63percent == 0:
-        # csum_norm is a 1xguessthickness_pxl array with all zeros
-        # csum_norm = np.zeros(1, guessthickness_pxl)
-        csum_norm = np.zeros((1, ny))
-
-        for ii in range(1, 2048):
-            guessthickness_pxl = guessthickness_pxl + 2
-            prof_partial = np.array(prof_row)
-            indices = list(range(2048 - ii, 2048 + ii + 1))
-            prof_partial_sum = prof_partial[indices].sum()
-            csum_norm[0, ii] = prof_partial_sum / totalarea
-            if not thickness63percent and csum_norm[0, ii] >= (1 - 1 / e):
-                thickness63percent = guessthickness_pxl
-
-    return thickness63percent
-
-
-def load_recon_model(width, position):
-    n = 4096
-    offset = 256
-    v = []
-    for i in range(0, n):
-        v.append(i - math.floor(n / 2))
-
-    kspace = compute_kspace(width)
-    mask = compute_mask(width, position)
-    masked_kspace = compute_masked_kspace(kspace, mask)
-
-    fieldSynthesisProfile = ft.fftshift(ft.ifft(ft.ifftshift(masked_kspace)))
-    df = pd.DataFrame(fieldSynthesisProfile)
-    lattice_efield = ft.fftshift(ft.ifft2(ft.ifftshift(masked_kspace)))
-    lattice = abs(lattice_efield) ** 2
-    lattice_hat = ft.fftshift(ft.fft2(ft.ifftshift(lattice)))
-
-    period = n / offset
-    if period == round(period):
-        recon = conv2(lattice, np.ones((1, int(period))) / period, 'same')
-    else:
-        for x in lattice_hat:
-            for y in x:
-                recon = y * (np.sinc(v / period))
-        recon = ft.fftshift(ft.ifft2(ft.ifftshift(recon)))
-    return recon
-
-
 def load_policy_model(checkpoint_file, optim=False):
     checkpoint = torch.load(checkpoint_file)
     args = checkpoint['args']
@@ -553,6 +252,7 @@ def load_policy_model(checkpoint_file, optim=False):
 # 当前width 49
 # 给一个probs -> 50 -> 从-25到25
 def get_policy_probs(model, recons, mask):
+    # num of columns
     channel_size = mask.shape[1]
     res = mask.size(-2)
     # Reshape trajectory dimension into batch dimension for parallel forward pass
@@ -592,20 +292,10 @@ def create_arg_parser():
     parser.add_argument('--exp_dir', type=pathlib.Path, default=None,
                         help='Directory where model and results should be saved. Will create a timestamped folder '
                              'in provided directory each run')
-    parser.add_argument('--accelerations', nargs='+', default=[8], type=int,
-                        help='Ratio of k-space columns to be sampled. If multiple values are '
-                             'provided, then one of those is chosen uniformly at random for '
-                             'each volume.')
-    parser.add_argument('--reciprocals_in_center', nargs='+', default=[1], type=float,
-                        help='Inverse fraction of rows (after subsampling) that should be in the center. E.g. if half '
-                             'of the sampled rows should be in the center, this should be set to 2. All combinations '
-                             'of acceleration and reciprocals-in-center will be used during training (every epoch a '
-                             'volume randomly gets assigned an acceleration and center fraction.')
     parser.add_argument('--acquisition_steps', default=16, type=int, help='Acquisition steps to train for per image.')
     parser.add_argument('--num_layers', type=int, default=4, help='Number of ConvNet layers. Note that setting '
                                                                   'this too high will cause size mismatch errors, due to even-odd errors in calculation for '
                                                                   'layer size post-flattening (due to max pooling).')
-    parser.add_argument('--drop_prob', type=float, default=0, help='Dropout probability')
     parser.add_argument('--batch_size', default=16, type=int, help='Mini batch size for training')
     parser.add_argument('--val_batch_size', default=64, type=int, help='Mini batch size for validation')
     parser.add_argument('--weight_decay', type=float, default=0,
@@ -618,7 +308,7 @@ def create_arg_parser():
     parser.add_argument('--do_train_ssim', type=str2bool, default=False,
                         help='Whether to compute SSIM values on training data.')
     parser.add_argument('--num_epochs', type=int, default=50,
-                        help='Number of training epochs')  # wenying change epochs test
+                        help='Number of training epochs')
     parser.add_argument('--seed', default=0, type=int, help='Seed for random number generators. '
                                                             'Set to 0 to use random seed.')
     parser.add_argument('--num_chans', type=int, default=16, help='Number of ConvNet channels in first layer.')
@@ -643,26 +333,16 @@ def create_arg_parser():
                         help='Discount factor in RL. Currently only used for non-greedy training.')
     parser.add_argument('--milestones', nargs='+', type=int, default=[0, 9, 19, 29, 39, 49],
                         help='Epochs at which to save model separately.')
-
     parser.add_argument('--do_train', type=str2bool, default=True,
                         help='Whether to do training or testing.')
-    parser.add_argument('--policy_model_checkpoint', type=pathlib.Path, default=None,
-                        help='Path to a pretrained policy model if do_train is False (testing).')
-
     parser.add_argument('--wandb', type=str2bool, default=False,
                         help='Whether to use wandb logging for this run.')
     parser.add_argument('--project', type=str2none, default=None,
                         help='Wandb project name to use.')
-
     parser.add_argument('--resume', type=str2bool, default=False,
                         help='Continue training previous run?')
     parser.add_argument('--run_id', type=str2none, default=None,
                         help='Wandb run_id to continue training from.')
-
-    parser.add_argument('--num_test_trajectories', type=int, default=1,
-                        help='Number of trajectories to use when testing sampling policy.')
-    parser.add_argument('--test_multi', type=str2bool, default=False,
-                        help='Test multiple models in one script')
     parser.add_argument('--policy_model_list', nargs='+', type=str, default=[None],
                         help='List of policy model paths for multi-testing.')
 
@@ -702,49 +382,25 @@ def train_and_eval(args, recon_args, recon_model):
     :param recon_args: reconstruction model arguments.
     :param recon_model: reconstruction model.
     """
-    # Load previously built policy network
-    if args.resume:
-        # Check that this works
-        resumed = True
-        new_run_dir = args.policy_model_checkpoint.parent
-        data_path = args.data_path
-        # In case models have been moved to a different machine, make sure the path to the recon model is the
-        # path provided.
-        recon_model_checkpoint = args.recon_model_checkpoint
+    # Improvement model to train
+    model = build_policy_model(args)
+    # Add mask parameters for training
+    # args = add_mask_params(args)
+    # if args.data_parallel:
+    #     model = torch.nn.DataParallel(model)
+    optimiser = build_optim(args, model.parameters())
+    start_epoch = 0
+    # Create directory to store results in
+    # savestr = '{}_res{}_al{}_accel{}_k{}_{}_{}'.format(args.dataset, args.resolution, args.acquisition_steps,
+    #                                                    args.accelerations, args.num_trajectories,
+    #                                                    datetime.datetime.now().strftime("%Y-%m-%d_%H:%M:%S"),
+    #                                                    ''.join(choice(ascii_uppercase) for _ in range(5)))
 
-        model, args, start_epoch, optimiser = load_policy_model(pathlib.Path(args.policy_model_checkpoint), optim=True)
-
-        args.old_run_dir = args.run_dir
-        args.old_recon_model_checkpoint = args.recon_model_checkpoint
-        args.old_data_path = args.data_path
-
-        args.recon_model_checkpoint = recon_model_checkpoint
-        args.run_dir = new_run_dir
-        args.data_path = data_path
-        args.resume = True
-    else: #what we run!!!!
-        resumed = False
-        # Improvement model to train
-        model = build_policy_model(args)
-        # Add mask parameters for training
-        # args = add_mask_params(args)
-        # if args.data_parallel:
-        #     model = torch.nn.DataParallel(model)
-        optimiser = build_optim(args, model.parameters())
-        start_epoch = 0
-        # Create directory to store results in
-        # savestr = '{}_res{}_al{}_accel{}_k{}_{}_{}'.format(args.dataset, args.resolution, args.acquisition_steps,
-        #                                                    args.accelerations, args.num_trajectories,
-        #                                                    datetime.datetime.now().strftime("%Y-%m-%d_%H:%M:%S"),
-        #                                                    ''.join(choice(ascii_uppercase) for _ in range(5)))
-
-        savestr = '{}_res{}_al{}_accel{}_k{}_{}'.format(args.dataset, args.resolution, args.acquisition_steps,
-                                                           args.accelerations, args.num_trajectories,
-                                                           ''.join(choice(ascii_uppercase) for _ in range(5)))
-        # # args.run_dir = args.exp_dir / savestr
-        # args.run_dir.mkdir(parents=True, exist_ok=False)
-
-    args.resumed = resumed
+    savestr = '{}_res{}_al{}_accel{}_k{}_{}'.format(args.dataset, args.resolution, args.acquisition_steps,
+                                                    args.accelerations, args.num_trajectories,
+                                                    ''.join(choice(ascii_uppercase) for _ in range(5)))
+    # # args.run_dir = args.exp_dir / savestr
+    # args.run_dir.mkdir(parents=True, exist_ok=False)
 
     if args.wandb:
         allow_val_change = args.resumed  # only allow changes if resumed: otherwise something is wrong.
@@ -794,7 +450,7 @@ def train_and_eval(args, recon_args, recon_model):
         train_loss, train_time = train_epoch(args, epoch, recon_model, model, train_loader, optimiser, writer,
                                              train_data_range_dict)
         logging.info(
-            f'Epoch = [{epoch+1:3d}/{args.num_epochs:3d}] TrainLoss = {train_loss:.3g} TrainTime = {train_time:.2f}s '
+            f'Epoch = [{epoch + 1:3d}/{args.num_epochs:3d}] TrainLoss = {train_loss:.3g} TrainTime = {train_time:.2f}s '
         )
         # 改loss -> width
         if args.do_train_ssim:
@@ -919,7 +575,6 @@ def evaluate(args, epoch, recon_model, model, loader, writer, partition, data_ra
 
                 score = compute_scores(width, position)
 
-
     # Logging
     if partition in ['Val', 'Train']:
         for step, val in enumerate(ssims):
@@ -951,7 +606,7 @@ def main(args):
     """
     logging.info(args)
     # Reconstruction model
-    recon_args, recon_model = load_recon_model(w, pos)
+    recon_args, recon_model = load_model(w, pos)
 
     # Policy model to train
     # args.do_train -> default to be true
@@ -1036,7 +691,7 @@ if __name__ == "__main__":
     kspace = compute_kspace(w)
     mask = compute_mask(w, pos)
     masked_kspace = compute_masked_kspace(kspace, mask)
-    recon = load_recon_model(w, pos)
+    recon = load_model(w, pos)
     score = compute_scores(recon)
     print(score)
 
@@ -1181,25 +836,26 @@ if __name__ == "__main__":
 
     ##demoFieldSynthesis()
 
-    # model, = load_policy_model()
-    # policy, probs = get_policy_probs(model, recon, mask)
+    model, = load_policy_model()
+    policy, probs = get_policy_probs(model, recon, mask)
 
-    # import torch.multiprocessing
-    # torch.multiprocessing.set_start_method('spawn')
-    #
-    # base_args = create_arg_parser().parse_args()
-    #
-    # # Testing multiple policy models with one script
-    # if base_args.test_multi:
-    #     assert not base_args.do_train, "Doing multiple model testing: do_train must be False."
-    #     assert base_args.policy_model_list[0] is not None, ("Doing multiple model testing: must "
-    #                                                         "have list of policy models.")
-    #
-    #     for model in base_args.policy_model_list:
-    #         args = copy.deepcopy(base_args)
-    #         args.policy_model_checkpoint = model
-    #         wrap_main(args)
-    #         wandb.join()
-    #
-    # else:
-    #     wrap_main(base_args)
+    import torch.multiprocessing
+
+    torch.multiprocessing.set_start_method('spawn')
+
+    base_args = create_arg_parser().parse_args()
+
+    # Testing multiple policy models with one script
+    if base_args.test_multi:
+        assert not base_args.do_train, "Doing multiple model testing: do_train must be False."
+        assert base_args.policy_model_list[0] is not None, ("Doing multiple model testing: must "
+                                                            "have list of policy models.")
+
+        for model in base_args.policy_model_list:
+            args = copy.deepcopy(base_args)
+            args.policy_model_checkpoint = model
+            wrap_main(args)
+            wandb.join()
+
+    else:
+        wrap_main(base_args)

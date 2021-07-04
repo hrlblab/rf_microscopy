@@ -14,7 +14,8 @@ from torch import nn
 from torch.nn import functional as F
 
 
-def PolicyModel(ne_img, args):
+def policy(ne_img, args):
+
     conv1 = tf.layers.conv2d(
         inputs=ne_img,
         filters=args.filters,
@@ -55,18 +56,6 @@ def PolicyModel(ne_img, args):
     pol = tf.distributions.Categorical(aprob)
 
     return pol
-
-
-def build_policy_model(args):
-    model = PolicyModel(
-        resolution=args.resolution,  # 4096 图片分辨率
-        filters=args.filters,  # 5 过滤器个数
-        in_chans=1,  # 1 输入数据的通道数
-        kernel_size=3,
-        strides=1,
-        padding='valid',
-    ).to(args.device)
-    return model
 
 
 class BasicBlock(nn.Module):
